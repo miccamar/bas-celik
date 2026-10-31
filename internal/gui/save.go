@@ -1,77 +1,21 @@
 package gui
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/storage"
+	"fyne.io/fyne/v2/widget"
 	"github.com/ubavic/bas-celik/v2/document"
 	"github.com/ubavic/bas-celik/v2/internal/logger"
-    "os"
-    "os/exec"
 )
-
-func savePdf(doc document.Document) func() {
-	return func() {
-		if doc == nil {
-			return
-		}
-
-		switch doc := doc.(type) {
-		case *document.IdDocument:
-			if state.pdfCyrillicLabels {
-				doc.SetCyrillicLabels()
-			}
-		}
-
-		pdf, fileName, err := doc.BuildPdf()
-
-		if err != nil {
-			setStatus("error.generatingPdf", fmt.Errorf("generating PDF: %w", err))
-			return
-		}
-
-		fDialog := dialog.NewFileSave(func(w fyne.URIWriteCloser, err error) {
-			if err != nil {
-				setStatus("error.writingPdf", fmt.Errorf("writing PDF: %w", err))
-				return
-			}
-
-			if w == nil {
-				return
-			}
-
-			saveLastUsedDirectory(w.URI())
-
-			_, err = w.Write(pdf)
-			if err != nil {
-				setStatus("error.writingPdf", fmt.Errorf("writing PDF: %w", err))
-				return
-			}
-
-			err = w.Close()
-			if err != nil {
-				setStatus("error.writingPdf", fmt.Errorf("writing PDF: %w", err))
-				return
-			}
-
-			setStatus("ui.pdfSaved", nil)
-		}, state.window)
-
-		fDialog.SetFilter(storage.NewExtensionFileFilter([]string{".pdf"}))
-		fDialog.SetFileName(fileName)
-		fDialog.SetView(dialog.ListView)
-
-		lastUsedDirectoryURI := getLastUsedDirectory()
-		if lastUsedDirectoryURI != nil {
-			fDialog.SetLocation(lastUsedDirectoryURI)
-		}
-
-		fDialog.Show()
-	}
-}
 
 func saveXlsx(doc document.Document) func() {
 	return func() {
@@ -80,7 +24,6 @@ func saveXlsx(doc document.Document) func() {
 		}
 
 		excel, fileName, err := doc.BuildExcel()
-
 		if err != nil {
 			setStatus("error.generatingXlsx", fmt.Errorf("generating Xlsx: %w", err))
 			return
@@ -91,7 +34,6 @@ func saveXlsx(doc document.Document) func() {
 				setStatus("error.writingXlsx", fmt.Errorf("writing xlsx: %w", err))
 				return
 			}
-
 			if w == nil {
 				return
 			}
@@ -128,20 +70,17 @@ func saveXlsx(doc document.Document) func() {
 
 func saveLastUsedDirectory(uri fyne.URI) {
 	directoryPath := filepath.Dir(uri.Path())
-
 	if directoryPath == "." || directoryPath == "" {
 		return
 	}
 
 	preferences := state.app.Preferences()
-
 	preferences.SetString(lastUsedDirectoryKey, directoryPath)
 }
 
 func getLastUsedDirectory() fyne.ListableURI {
 	preferences := state.app.Preferences()
 	lastUsedDirectory := preferences.String(lastUsedDirectoryKey)
-
 	if lastUsedDirectory == "" {
 		return nil
 	}
@@ -156,56 +95,181 @@ func getLastUsedDirectory() fyne.ListableURI {
 	return listableURI
 }
 
-    //Dodajemo print funkciju
+// getSystemPrinters pronalazi sve dostupne štampače na sistemu
+func getSystemPrinters() ([]string, string) {
+	printersMap := make(map[string]bool)
+	defaultPrinter := ""
 
-func printPdf(doc document.Document) func() {
+	// 1. Očitavanje aktivnih štampača preko lpstat -a
+	cmd := exec.Command("lpstat", "-a")
+	if out, err := cmd.Output(); err == nil {
+		scanner := bufio.NewScanner(bytes.NewReader(out))
+		for scanner.Scan() {
+			fields := strings.Fields(scanner.Text())
+			if len(fields) > 0 {
+				printersMap[fields[0]] = true
+			}
+		}
+	}
+
+	// 2. Rezervna pretraga preko lpstat -e
+	if len(printersMap) == 0 {
+		cmdE := exec.Command("lpstat", "-e")
+		if out, err := cmdE.Output(); err == nil {
+			scanner := bufio.NewScanner(bytes.NewReader(out))
+			for scanner.Scan() {
+				p := strings.TrimSpace(scanner.Text())
+				if p != "" {
+					printersMap[p] = true
+				}
+			}
+		}
+	}
+
+	// 3. Pronalaženje podrazumevanog štampača
+	cmdDef := exec.Command("lpstat", "-d")
+	if outDef, err := cmdDef.Output(); err == nil {
+		parts := strings.Split(string(outDef), ":")
+		if len(parts) >= 2 {
+			defaultPrinter = strings.TrimSpace(parts[1])
+		}
+	}
+
+	printers := make([]string, 0, len(printersMap))
+	for p := range printersMap {
+		printers = append(printers, p)
+	}
+
+	return printers, defaultPrinter
+}
+
+// printOrSaveDialog otvara prozor za izbor štampača ili čuvanje u PDF
+func printOrSaveDialog(doc document.Document) func() {
 	return func() {
 		if doc == nil {
 			return
 		}
 
-		switch doc := doc.(type) {
-		case *document.IdDocument:
+		if idDoc, ok := doc.(*document.IdDocument); ok {
 			if state.pdfCyrillicLabels {
-				doc.SetCyrillicLabels()
+				idDoc.SetCyrillicLabels()
 			}
 		}
 
-		pdf, _, err := doc.BuildPdf()
+		pdf, fileName, err := doc.BuildPdf()
 		if err != nil {
 			setStatus("error.generatingPdf", fmt.Errorf("generating PDF: %w", err))
 			return
 		}
 
-		// Pravimo privremeni PDF fajl
-		tempFile, err := os.CreateTemp("", "bas-celik-print-*.pdf")
-		if err != nil {
-			logger.Error(fmt.Errorf("creating temp print file: %w", err))
-			return
-		}
-		tempPath := tempFile.Name()
+		printers, defaultPrinter := getSystemPrinters()
 
-		if _, err := tempFile.Write(pdf); err != nil {
-			tempFile.Close()
-			os.Remove(tempPath)
-			logger.Error(fmt.Errorf("writing temp print file: %w", err))
-			return
-		}
-		tempFile.Close()
+		const saveAsPdfOption = "Sačuvaj kao PDF..."
+		options := []string{saveAsPdfOption}
+		options = append(options, printers...)
 
-		// Šaljemo na podrazumevani štampač preko CUPS komande 'lpr'
-		cmd := exec.Command("lpr", tempPath)
-		err = cmd.Run()
-
-		// Brišemo privremeni fajl
-		_ = os.Remove(tempPath)
-
-		if err != nil {
-			logger.Error(fmt.Errorf("running lpr: %w", err))
-			return
+		selectedTarget := saveAsPdfOption
+		if defaultPrinter != "" {
+			selectedTarget = defaultPrinter
+		} else if len(printers) > 0 {
+			selectedTarget = printers[0]
 		}
 
-		// Obaveštenje u statusnoj traci
-		setTimedStatus("Dokument poslat na štampu")
+		selectWidget := widget.NewSelect(options, func(s string) {
+			selectedTarget = s
+		})
+		selectWidget.SetSelected(selectedTarget)
+
+		content := widget.NewForm(
+			widget.NewFormItem("Odredište:", selectWidget),
+		)
+
+		d := dialog.NewCustomConfirm(
+			"Štampanje dokumenta",
+			"Potvrdi",
+			"Odustani",
+			content,
+			func(confirmed bool) {
+				if !confirmed {
+					return
+				}
+
+				if selectedTarget == saveAsPdfOption {
+					savePdfWithData(pdf, fileName)
+					return
+				}
+
+				go func(targetPrinter string) {
+					tempFile, err := os.CreateTemp("", "bas-celik-print-*.pdf")
+					if err != nil {
+						logger.Error(fmt.Errorf("creating temp file: %w", err))
+						return
+					}
+					tempPath := tempFile.Name()
+
+					if _, err := tempFile.Write(pdf); err != nil {
+						tempFile.Close()
+						_ = os.Remove(tempPath)
+						logger.Error(fmt.Errorf("writing temp file: %w", err))
+						return
+					}
+					tempFile.Close()
+
+					cmd := exec.Command("lpr", "-P", targetPrinter, tempPath)
+					cmdErr := cmd.Run()
+					_ = os.Remove(tempPath)
+
+					if cmdErr != nil {
+						logger.Error(fmt.Errorf("lpr error: %w", cmdErr))
+						setTimedStatus("Greška pri slanju na štampač")
+						return
+					}
+
+					setTimedStatus("Poslato na: " + targetPrinter)
+				}(selectedTarget)
+			},
+			state.window,
+		)
+
+		d.Resize(fyne.NewSize(380, 150))
+		d.Show()
 	}
+}
+
+// savePdfWithData otvara standardni dijalog za snimanje fajla
+func savePdfWithData(pdf []byte, fileName string) {
+	fDialog := dialog.NewFileSave(func(w fyne.URIWriteCloser, err error) {
+		if err != nil {
+			setStatus("error.writingPdf", fmt.Errorf("writing PDF: %w", err))
+			return
+		}
+		if w == nil {
+			return
+		}
+
+		saveLastUsedDirectory(w.URI())
+
+		if _, err = w.Write(pdf); err != nil {
+			setStatus("error.writingPdf", fmt.Errorf("writing PDF: %w", err))
+			return
+		}
+
+		if err = w.Close(); err != nil {
+			setStatus("error.writingPdf", fmt.Errorf("writing PDF: %w", err))
+			return
+		}
+
+		setStatus("ui.pdfSaved", nil)
+	}, state.window)
+
+	fDialog.SetFilter(storage.NewExtensionFileFilter([]string{".pdf"}))
+	fDialog.SetFileName(fileName)
+	fDialog.SetView(dialog.ListView)
+
+	lastUsedDirectoryURI := getLastUsedDirectory()
+	if lastUsedDirectoryURI != nil {
+		fDialog.SetLocation(lastUsedDirectoryURI)
+	}
+
+	fDialog.Show()
 }
